@@ -1,3 +1,4 @@
 *.csv
 figs/*
 .env
+.venv

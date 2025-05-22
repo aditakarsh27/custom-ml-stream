@@ -36,7 +36,8 @@ for key, default in [
     ("file_uploader_key", 0),
     ("awaiting_response", False),
     ("current_question", ""),
-    ("code", "")
+    ("code", ""),
+    ("namespace", {})
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -92,6 +93,49 @@ def generate_df_description(df):
     
     return response.choices[0].message.content
 
+
+def get_data_cleaning_prompt(df_info, df_sample):
+    return f"""
+You are an expert data scientist. The user has uploaded a dataset with the following info:
+
+DataFrame info:
+{df_info}
+
+Sample data (first 5 rows):
+{df_sample}
+
+Write Python code to automatically clean this DataFrame:
+- Handle missing values, duplicates, and obviously wrong entries.
+- Encode categorical variables as needed.
+- Add comments explaining each step.
+- The cleaned DataFrame should be assigned to a variable called 'df_clean'.
+- Do NOT print the whole DataFrame. Instead, print a summary of changes made.
+
+Wrap your code in triple backticks.
+    """
+
+def get_automl_prompt(df_info, df_sample):
+    return f"""
+You are an expert ML engineer. The user has uploaded a cleaned DataFrame with this info:
+
+DataFrame info:
+{df_info}
+
+Sample data (first 5 rows):
+{df_sample}
+
+Write Python code to:
+- Select a suitable target column for prediction, justify your choice in comments.
+- If the target is numeric, do regression; if categorical, do classification.
+- Do a simple train/test split, train a model, and print test set metrics.
+- Use only pandas, numpy, scikit-learn.
+- Assign the trained model to a variable named 'model' and predictions to 'y_pred'.
+- Print only the evaluation metric(s) and a short explanation.
+
+Wrap your code in triple backticks.
+    """
+
+
 def interpret_code_output(code, output, conversation_history):
     """Use the LLM to interpret the code output in a user-friendly way"""
     # Get dataframe context
@@ -131,8 +175,33 @@ def interpret_code_output(code, output, conversation_history):
     
     return response.choices[0].message.content
 
-def process_data_query(query, df, conversation_history):
-    """Process a data query using the OpenAI API with conversation history"""
+def get_error_correction_prompt(original_query, code, error, df_info, columns, df_sample):
+    return f"""
+You wrote the following Python code for the user's previous request:
+
+User request:
+{original_query}
+
+The DataFrame has the following information:
+{df_info}
+
+Column Names and Types:
+{columns}
+
+Sample Data (first 5 rows):
+{df_sample}
+
+Code:
+{code}
+But when executing the code, the following error occurred:
+{error}
+First think and reason about the error, then correct the code so it works as intended. Provide the COMPLETE revised Python code, wrapped in triple backticks. Reference the DataFrame as 'df'.
+Add comments explaining changes if necessary.
+"""
+
+
+def process_data_query(query, df, conversation_history, max_retries=3):
+    """Process a data query using the OpenAI API with conversation history, with automatic error correction and retries."""
     # Use the stored dataframe context
     df_info = st.session_state.df_context.get("df_info", "")
     columns = st.session_state.df_context.get("columns", "")
@@ -140,125 +209,150 @@ def process_data_query(query, df, conversation_history):
     
     # Format conversation history for the prompt
     messages = []
-    
-    # System message first
     messages.append({
         "role": "system", 
         "content": f"""You are a data analysis assistant. Help the user analyze their CSV data.
-        
         The DataFrame has the following information:
         {df_info}
-        
         Column Names and Types:
         {columns}
-        
         Sample Data (first 5 rows):
         {df_sample}
-        
         If the user's question requires generating a visualization or performing an analysis, provide Python code using pandas, matplotlib, seaborn, or plotly.
         For visualizations, use plt.figure(figsize=(10, 6)) for matplotlib plots to ensure they're readable.
         For any results that need to be shown, print the results.
         Wrap your code in ```python and ``` tags.
         If the question is general or asking for information, provide a helpful response without code.
-        Your Python code should reference the DataFrame as 'df'.
+        Your Python code should reference the DataFrame as 'df'. You have access to the complete chat history, including user queries, LLM responses, and successfully executed code. So, you can use variables from previous messages if needed. The variables present in the namespace are: {', '.join(st.session_state.namespace.keys())}
         """
     })
-    
-    # Add previous conversation for context
+    print("NAMESPACE", st.session_state.namespace)
     for msg in conversation_history:
         messages.append(msg)
-    
-    # Add the current query
     messages.append({"role": "user", "content": query})
-    
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=1000
-    )
-    response_text = response.choices[0].message.content
 
-    if "```python" in response_text:
-        code_start = response_text.find("```python") + 9
-        code_end = response_text.find("```", code_start)
-        code = response_text[code_start:code_end].strip()
-        explanation = response_text.replace("```python" + code + "```", "").strip()
-        try:
-            old_stdout = sys.stdout
-            sys.stdout = mystdout = io.StringIO()
+    # Main retry loop
+    retries = 0
+    original_query = query
+    last_code = None
+    last_error = None
+    last_explanation = ""
+    while retries <= max_retries:
+        # Get response (original or correction)
+        if retries == 0:
+            prompt_messages = messages
+        else:
+            # Correction step
+            correction_prompt = get_error_correction_prompt(
+                original_query, last_code, last_error, df_info, columns, df_sample
+            )
+            prompt_messages = [{
+                "role": "system", "content": messages[0]["content"]
+            }, {
+                "role": "user", "content": correction_prompt
+            }]
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=prompt_messages,
+            max_tokens=2000
+        )
+        response_text = response.choices[0].message.content
 
-            # Namespace for code execution
-            local_vars = {"df": df, "pd": pd, "plt": plt, "px": px, "sns": sns, "np": np, "io": io, "base64": base64, "st": st}
-            exec(code, local_vars)
-            # After exec(code, local_vars)
-            printed_output = mystdout.getvalue()
-            sys.stdout = old_stdout
+        if "```python" in response_text:
+            code_start = response_text.find("```python") + 9
+            code_end = response_text.find("```", code_start)
+            code = response_text[code_start:code_end].strip()
+            explanation = response_text.replace("```python" + code + "```", "").strip()
+            if retries == 0:
+                st.session_state.messages.append({"role": "assistant", "content": explanation})
+            try:
+                old_stdout = sys.stdout
+                sys.stdout = mystdout = io.StringIO()
+                local_vars = st.session_state.namespace
+                if "df" not in local_vars:
+                    local_vars["df"] = df
+                exec(code, local_vars)
+                printed_output = mystdout.getvalue()
+                sys.stdout = old_stdout
 
-            # ----------- Matplotlib -----------
-            figs_matplotlib = []
-            for n in plt.get_fignums():
-                fig = plt.figure(n)
-                figs_matplotlib.append(fig)
+                # ----------- Matplotlib -----------
+                figs_matplotlib = []
+                for n in plt.get_fignums():
+                    fig = plt.figure(n)
+                    figs_matplotlib.append(fig)
 
-            # ----------- Plotly -----------
-            fig_plotly = None
-            for v in local_vars.values():
-                if str(type(v)).startswith("<class 'plotly.graph_objs._figure.Figure"):
-                    fig_plotly = v
-                    break
-            if 'fig' in local_vars:
-                try:
-                    import plotly.graph_objs
-                    if isinstance(local_vars['fig'], plotly.graph_objs.Figure):
-                        fig_plotly = local_vars['fig']
-                except ImportError:
-                    pass
+                # ----------- Plotly -----------
+                fig_plotly = None
+                for v in local_vars.values():
+                    if str(type(v)).startswith("<class 'plotly.graph_objs._figure.Figure"):
+                        fig_plotly = v
+                        break
+                if 'fig' in local_vars:
+                    try:
+                        import plotly.graph_objs
+                        if isinstance(local_vars['fig'], plotly.graph_objs.Figure):
+                            fig_plotly = local_vars['fig']
+                    except ImportError:
+                        pass
 
-            interpreted_output = ""
-            if printed_output.strip():
-                interpreted_output = interpret_code_output(code, printed_output, conversation_history)
-
+                interpreted_output = ""
+                if printed_output.strip():
+                    interpreted_output = interpret_code_output(code, printed_output, conversation_history)
+                # SUCCESS
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                st.session_state.messages.append({"role": "function", "content": printed_output})
+                st.session_state.namespace = local_vars
+                return {
+                    "explanation": explanation,
+                    "code": code,
+                    "output": printed_output,
+                    "interpreted_output": interpreted_output,
+                    "figs_matplotlib": figs_matplotlib,
+                    "fig_plotly": fig_plotly
+                }
+            except Exception as e:
+                last_code = code
+                last_error = str(e)
+                last_explanation = explanation
+                retries += 1
+                continue  # Retry
+        else:
+            # Not code, so just return as before
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
             return {
-                "explanation": explanation,
-                "code": code,
-                "output": printed_output,
-                "interpreted_output": interpreted_output,
-                "figs_matplotlib": figs_matplotlib,  # <- list of all figures
-                "fig_plotly": fig_plotly
-            }
-
-
-        except Exception as e:
-            return {
-                "explanation": explanation,
-                "code": code,
-                "output": f"Error executing code: {str(e)}",
+                "explanation": response_text,
+                "code": None,
+                "output": None,
                 "interpreted_output": "",
                 "fig_matplotlib": None,
                 "fig_plotly": None
             }
-    else:
-        return {
-            "explanation": response_text,
-            "code": None,
-            "output": None,
-            "interpreted_output": "",
-            "fig_matplotlib": None,
-            "fig_plotly": None
-        }
+
+    # If we exhaust retries, return the last error
+    return {
+        "explanation": f"{last_explanation}\n\nError after {max_retries} retries: {last_error}",
+        "code": last_code,
+        "output": f"Error after {max_retries} retries: {last_error}",
+        "interpreted_output": "",
+        "fig_matplotlib": None,
+        "fig_plotly": None
+    }
+
 
 def handle_file_upload(uploaded_file):
     try:
         file_type = uploaded_file.name.split('.')[-1].lower()
-        
         if file_type == 'csv':
             df = pd.read_csv(uploaded_file)
         elif file_type in ['xlsx', 'xls']:
             df = pd.read_excel(uploaded_file)
         else:
             raise ValueError(f"Unsupported file format: {file_type}")
-            
+
         st.session_state.df = df
+
+        # Step 1: Data Exploration (already done)
         with st.spinner("Analyzing your data..."):
             description = generate_df_description(df)
             st.session_state.df_description = description
@@ -266,6 +360,47 @@ def handle_file_upload(uploaded_file):
             "role": "assistant",
             "content": f"📊 Successfully loaded **{uploaded_file.name}** with {len(df)} rows and {len(df.columns)} columns.\n\n{description}"
         })
+
+        # Prepare context for LLM prompts
+        buffer = io.StringIO()
+        df.info(buf=buffer)
+        df_info = buffer.getvalue()
+        df_sample = df.head(5).to_string()
+
+        # Step 2: Data Cleaning (ask LLM for code, run, and update df)
+        cleaning_prompt = get_data_cleaning_prompt(df_info, df_sample)
+        result_cleaning = process_data_query(cleaning_prompt, df, [])
+        # Execute cleaning code and update df
+        if result_cleaning['code']:
+            # The exec should have created 'df_clean' in the local_vars
+            local_vars = {"df": df, "pd": pd, "np": np}
+            exec(result_cleaning['code'], local_vars)
+            df_clean = local_vars.get("df_clean", df)
+            st.session_state.df = df_clean  # update for downstream
+            # Show message
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"🧹 **Data Cleaning Step:**\n\n{result_cleaning['interpreted_output'] or result_cleaning['output'] or result_cleaning['explanation']}"
+            })
+        else:
+            df_clean = df
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "No cleaning was performed by the LLM."
+            })
+
+        # Step 3: Auto ML (ask LLM for code, run, show result)
+        buffer = io.StringIO()
+        df_clean.info(buf=buffer)
+        df_info_clean = buffer.getvalue()
+        df_sample_clean = df_clean.head(5).to_string()
+        automl_prompt = get_automl_prompt(df_info_clean, df_sample_clean)
+        result_ml = process_data_query(automl_prompt, df_clean, [])
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"🤖 **AutoML Step:**\n\n{result_ml['interpreted_output'] or result_ml['output'] or result_ml['explanation']}"
+        })
+
     except Exception as e:
         error_msg = f"Error reading file: {str(e)}"
         st.session_state.messages.append({"role": "assistant", "content": error_msg})
@@ -284,6 +419,8 @@ with left_col:
     with chat_container:
         # Limit number of chat messages for display (e.g. last 25)
         for message in st.session_state.messages[-25:]:
+            if message["role"] == "function":
+                continue
             align = "assistant" if message["role"] == "assistant" else "user"
             with st.chat_message(align):
                 st.markdown(message["content"])
