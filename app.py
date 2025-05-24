@@ -130,6 +130,7 @@ Write Python code to:
 - Do a simple train/test split, train a model, and print test set metrics.
 - Use only pandas, numpy, scikit-learn.
 - Assign the trained model to a variable named 'model' and predictions to 'y_pred'.
+- Encode all categorical features using one-hot encoding before fitting the model. If not required, drop the columns.
 - Print only the evaluation metric(s) and a short explanation.
 - Use imbalanced-learn for imbalanced datasets, and also decide other such techniques if needed based on the inforamtion about the dataset above.
 
@@ -176,7 +177,7 @@ def interpret_code_output(code, output, conversation_history):
     
     return response.choices[0].message.content
 
-def get_error_correction_prompt(original_query, code, error, df_info, columns, df_sample):
+def get_error_correction_prompt(original_query, code, error, df_info, columns, df_sample, output):
     return f"""
 You wrote the following Python code for the user's previous request:
 
@@ -196,17 +197,28 @@ Code:
 {code}
 But when executing the code, the following error occurred:
 {error}
+The code generated the following output:
+{output}
 First think and reason about the error, then correct the code so it works as intended. Provide the COMPLETE revised Python code, wrapped in triple backticks. Reference the DataFrame as 'df'.
 Add comments explaining changes if necessary.
+Your Python code should reference the DataFrame as 'df'. It will be present in the namespace when the code is executed, so do not write code to create it.
 """
 
 
-def process_data_query(query, df, conversation_history, max_retries=7):
+def process_data_query(query, df, conversation_history, max_retries=3):
     """Process a data query using the OpenAI API with conversation history, with automatic error correction and retries."""
     # Use the stored dataframe context
-    df_info = st.session_state.df_context.get("df_info", "")
-    columns = st.session_state.df_context.get("columns", "")
-    df_sample = st.session_state.df_context.get("df_sample", "")
+    df = st.session_state.namespace.get("df", df)
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    df_info = buffer.getvalue()
+    
+    # Get sample data
+    df_sample = df.head(5).to_string()
+    
+    # Get column descriptions
+    columns_desc = df.describe().to_string()
+    columns = df.dtypes.to_string()
     
     # Format conversation history for the prompt
     messages = []
@@ -224,10 +236,9 @@ def process_data_query(query, df, conversation_history, max_retries=7):
         For any results that need to be shown, print the results.
         Wrap your code in ```python and ``` tags.
         If the question is general or asking for information, provide a helpful response without code.
-        Your Python code should reference the DataFrame as 'df'. You have access to the complete chat history, including user queries, LLM responses, and successfully executed code. So, you can use variables from previous messages if needed. The variables present in the namespace are: {', '.join(st.session_state.namespace.keys())}
+        Your Python code should reference the DataFrame as 'df'. It will be present in the namespace when the code is executed, so do not write code to create it. You have access to the complete chat history, including user queries, LLM responses, and successfully executed code. So, you can use variables from previous messages if needed. The variables present in the namespace are: {', '.join(st.session_state.namespace.keys())}
         """
     })
-    print("NAMESPACE", st.session_state.namespace)
     for msg in conversation_history:
         messages.append(msg)
     messages.append({"role": "user", "content": query})
@@ -244,13 +255,24 @@ def process_data_query(query, df, conversation_history, max_retries=7):
             prompt_messages = messages
         else:
             # Correction step
+            df = st.session_state.namespace.get("df", df)
+            buffer = io.StringIO()
+            df.info(buf=buffer)
+            df_info = buffer.getvalue()
+            
+            # Get sample data
+            df_sample = df.head(5).to_string()
+            
+            # Get column descriptions
+            columns_desc = df.describe().to_string()
+            columns = df.dtypes.to_string()
             correction_prompt = get_error_correction_prompt(
-                original_query, last_code, last_error, df_info, columns, df_sample
+                original_query, last_code, last_error, df_info, columns, df_sample, output
             )
             prompt_messages = [{
                 "role": "system", "content": messages[0]["content"]
             }, {
-                "role": "function", "content": correction_prompt
+                "role": "function", "content": correction_prompt, "name": "error_correction_prompt"
             }]
         
         response = client.chat.completions.create(
@@ -265,8 +287,6 @@ def process_data_query(query, df, conversation_history, max_retries=7):
             code_end = response_text.find("```", code_start)
             code = response_text[code_start:code_end].strip()
             explanation = response_text.replace("```python" + code + "```", "").strip()
-            if retries == 0:
-                st.session_state.messages.append({"role": "assistant", "content": explanation})
             try:
                 old_stdout = sys.stdout
                 sys.stdout = mystdout = io.StringIO()
@@ -301,8 +321,8 @@ def process_data_query(query, df, conversation_history, max_retries=7):
                 if printed_output.strip():
                     interpreted_output = interpret_code_output(code, printed_output, conversation_history)
                 # SUCCESS
-                st.session_state.messages.append({"role": "function", "content": response_text})
-                st.session_state.messages.append({"role": "function", "content": printed_output})
+                st.session_state.messages.append({"role": "function", "content": response_text, "name": "final_code_explanation"})
+                st.session_state.messages.append({"role": "function", "content": printed_output, "name": "final_output"})
                 st.session_state.namespace = local_vars
                 return {
                     "explanation": explanation,
@@ -313,6 +333,7 @@ def process_data_query(query, df, conversation_history, max_retries=7):
                     "fig_plotly": fig_plotly
                 }
             except Exception as e:
+                output = mystdout.getvalue()
                 last_code = code
                 last_error = str(e)
                 last_explanation = explanation
@@ -361,45 +382,46 @@ def handle_file_upload(uploaded_file):
             "role": "assistant",
             "content": f"📊 Successfully loaded **{uploaded_file.name}** with {len(df)} rows and {len(df.columns)} columns.\n\n{description}"
         })
+        
 
-        # Prepare context for LLM prompts
-        buffer = io.StringIO()
-        df.info(buf=buffer)
-        df_info = buffer.getvalue()
-        df_sample = df.head(5).to_string()
+        # # Prepare context for LLM prompts
+        # buffer = io.StringIO()
+        # df.info(buf=buffer)
+        # df_info = buffer.getvalue()
+        # df_sample = df.head(5).to_string()
 
-        # Step 2: Data Cleaning (ask LLM for code, run, and update df)
-        cleaning_prompt = get_data_cleaning_prompt(df_info, df_sample)
-        result_cleaning = process_data_query(cleaning_prompt, df, [])
-        # Execute cleaning code and update df
-        if result_cleaning['code']:
-            # The exec should have created 'df_clean' in the local_vars
-            result_cleaning = process_data_query(cleaning_prompt, df, [])
-            df_clean = st.session_state.namespace.get("df_clean", df)
-            st.session_state.df = df_clean
-            # Show message
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": f"🧹 **Data Cleaning Step:**\n\n{result_cleaning['interpreted_output'] or result_cleaning['output'] or result_cleaning['explanation']}"
-            })
-        else:
-            df_clean = df
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": "No cleaning was performed by the LLM."
-            })
+        # # Step 2: Data Cleaning (ask LLM for code, run, and update df)
+        # cleaning_prompt = get_data_cleaning_prompt(df_info, df_sample)
+        # result_cleaning = process_data_query(cleaning_prompt, df, [])
+        # # Execute cleaning code and update df
+        # if result_cleaning['code']:
+        #     # The exec should have created 'df_clean' in the local_vars
+        #     result_cleaning = process_data_query(cleaning_prompt, df, [])
+        #     df_clean = st.session_state.namespace.get("df_clean", df)
+        #     st.session_state.df = df_clean
+        #     # Show message
+        #     st.session_state.messages.append({
+        #         "role": "assistant",
+        #         "content": f"🧹 **Data Cleaning Step:**\n\n{result_cleaning['interpreted_output'] or result_cleaning['output'] or result_cleaning['explanation']}"
+        #     })
+        # else:
+        #     df_clean = df
+        #     st.session_state.messages.append({
+        #         "role": "assistant",
+        #         "content": "No cleaning was performed by the LLM."
+        #     })
 
-        # Step 3: Auto ML (ask LLM for code, run, show result)
-        buffer = io.StringIO()
-        df_clean.info(buf=buffer)
-        df_info_clean = buffer.getvalue()
-        df_sample_clean = df_clean.head(5).to_string()
-        automl_prompt = get_automl_prompt(df_info_clean, df_sample_clean)
-        result_ml = process_data_query(automl_prompt, df_clean, [])
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": f"🤖 **AutoML Step:**\n\n{result_ml['interpreted_output'] or result_ml['output'] or result_ml['explanation']}"
-        })
+        # # Step 3: Auto ML (ask LLM for code, run, show result)
+        # buffer = io.StringIO()
+        # df_clean.info(buf=buffer)
+        # df_info_clean = buffer.getvalue()
+        # df_sample_clean = df_clean.head(5).to_string()
+        # automl_prompt = get_automl_prompt(df_info_clean, df_sample_clean)
+        # result_ml = process_data_query(automl_prompt, df_clean, [])
+        # st.session_state.messages.append({
+        #     "role": "assistant",
+        #     "content": f"🤖 **AutoML Step:**\n\n{result_ml['interpreted_output'] or result_ml['output'] or result_ml['explanation']}"
+        # })
 
     except Exception as e:
         error_msg = f"Error reading file: {str(e)}"
