@@ -250,7 +250,7 @@ def process_data_query(query, df, conversation_history, max_retries=7):
             prompt_messages = [{
                 "role": "system", "content": messages[0]["content"]
             }, {
-                "role": "tool", "content": correction_prompt
+                "role": "function", "content": correction_prompt
             }]
         
         response = client.chat.completions.create(
@@ -301,7 +301,7 @@ def process_data_query(query, df, conversation_history, max_retries=7):
                 if printed_output.strip():
                     interpreted_output = interpret_code_output(code, printed_output, conversation_history)
                 # SUCCESS
-                st.session_state.messages.append({"role": "tool", "content": response_text})
+                st.session_state.messages.append({"role": "function", "content": response_text})
                 st.session_state.messages.append({"role": "function", "content": printed_output})
                 st.session_state.namespace = local_vars
                 return {
