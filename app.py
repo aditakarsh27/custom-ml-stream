@@ -205,7 +205,7 @@ Your Python code should reference the DataFrame as 'df'. It will be present in t
 """
 
 
-def process_data_query(query, df, conversation_history, max_retries=3):
+def process_data_query(query, df, conversation_history, max_retries=7):
     """Process a data query using the OpenAI API with conversation history, with automatic error correction and retries."""
     # Use the stored dataframe context
     df = st.session_state.namespace.get("df", df)
