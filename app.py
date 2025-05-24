@@ -108,7 +108,7 @@ Write Python code to automatically clean this DataFrame:
 - Handle missing values, duplicates, and obviously wrong entries.
 - Encode categorical variables as needed.
 - Add comments explaining each step.
-- The cleaned DataFrame should be assigned to a variable called 'df_clean'.
+- The cleaned DataFrame should be assigned to a variable called 'df_clean' by the end of the code.
 - Do NOT print the whole DataFrame. Instead, print a summary of changes made.
 
 Wrap your code in triple backticks.
@@ -131,6 +131,7 @@ Write Python code to:
 - Use only pandas, numpy, scikit-learn.
 - Assign the trained model to a variable named 'model' and predictions to 'y_pred'.
 - Print only the evaluation metric(s) and a short explanation.
+- Use imbalanced-learn for imbalanced datasets, and also decide other such techniques if needed based on the inforamtion about the dataset above.
 
 Wrap your code in triple backticks.
     """
@@ -373,10 +374,9 @@ def handle_file_upload(uploaded_file):
         # Execute cleaning code and update df
         if result_cleaning['code']:
             # The exec should have created 'df_clean' in the local_vars
-            local_vars = {"df": df, "pd": pd, "np": np}
-            exec(result_cleaning['code'], local_vars)
-            df_clean = local_vars.get("df_clean", df)
-            st.session_state.df = df_clean  # update for downstream
+            result_cleaning = process_data_query(cleaning_prompt, df, [])
+            df_clean = st.session_state.namespace.get("df_clean", df)
+            st.session_state.df = df_clean
             # Show message
             st.session_state.messages.append({
                 "role": "assistant",

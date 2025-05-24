@@ -8,3 +8,4 @@ numpy
 seaborn 
 openpyxl
 scikit-learn
+imbalanced-learn
