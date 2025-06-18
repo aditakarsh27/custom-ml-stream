@@ -37,10 +37,116 @@ for key, default in [
     ("awaiting_response", False),
     ("current_question", ""),
     ("code", ""),
-    ("namespace", {})
+    ("namespace", {}),
+    ("excel_sheets", []),  # New: List of sheet names in Excel file
+    ("current_sheet", None),  # New: Currently selected sheet
+    ("excel_metadata", {}),  # New: Store Excel-specific metadata
+    ("is_excel", False)  # New: Flag to indicate if current file is Excel
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+def analyze_excel_structure(excel_file):
+    """Analyze Excel file structure including sheets, tables, and cell formatting"""
+    try:
+        # Read Excel file with openpyxl to get detailed structure
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_file, data_only=True)
+        
+        metadata = {
+            "sheets": {},
+            "tables": [],
+            "named_ranges": []
+        }
+        
+        # Analyze each sheet
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            sheet_info = {
+                "name": sheet_name,
+                "dimensions": ws.dimensions,
+                "merged_cells": [str(r) for r in ws.merged_cells.ranges],
+                "has_header": False,
+                "potential_tables": []
+            }
+            
+            # Detect tables and header rows
+            data_region = ws.calculate_dimension()
+            if ":" in data_region:
+                min_col, min_row, max_col, max_row = openpyxl.utils.range_boundaries(data_region)
+                # Check first row for headers
+                header_row = []
+                for col in range(min_col, max_col + 1):
+                    cell = ws.cell(min_row, col)
+                    if cell.font.bold or cell.fill.start_color.index != '00000000':
+                        sheet_info["has_header"] = True
+                    header_row.append(cell.value)
+                
+                # Detect potential table regions
+                if sheet_info["has_header"]:
+                    sheet_info["potential_tables"].append({
+                        "range": data_region,
+                        "headers": header_row
+                    })
+            
+            metadata["sheets"][sheet_name] = sheet_info
+        
+        return metadata
+    except Exception as e:
+        st.warning(f"Could not perform detailed Excel analysis: {str(e)}")
+        return None
+
+def generate_excel_description(df, metadata):
+    """Generate a description of the Excel file structure and content"""
+    # Get basic dataframe info
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    df_info = buffer.getvalue()
+    
+    # Get sample data
+    df_sample = df.head(5).to_string()
+    
+    # Get column descriptions
+    columns_desc = df.describe().to_string()
+    
+    # Create Excel-specific prompt
+    prompt = f"""
+    I have an Excel file with the following structure and data:
+    
+    Excel Structure:
+    - Number of sheets: {len(metadata['sheets'])}
+    - Sheet names: {', '.join(metadata['sheets'].keys())}
+    
+    Current Sheet Data:
+    DataFrame Info:
+    {df_info}
+    
+    Sample Data (first 5 rows):
+    {df_sample}
+    
+    Summary Statistics:
+    {columns_desc}
+    
+    Sheet Details:
+    {metadata}
+    
+    Please provide a comprehensive analysis including:
+    1. Overall Excel file structure and organization
+    2. Current sheet's data characteristics and potential purpose
+    3. Data types and their appropriateness
+    4. Presence of headers, tables, and special formatting
+    5. Any notable patterns or relationships in the data
+    6. Potential data quality issues or areas needing attention
+    7. Suggestions for analysis based on the data structure
+    """
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000
+    )
+    
+    return response.choices[0].message.content
 
 def generate_df_description(df):
     """Generate a description of the dataframe using the OpenAI API"""
@@ -220,25 +326,49 @@ def process_data_query(query, df, conversation_history, max_retries=7):
     columns_desc = df.describe().to_string()
     columns = df.dtypes.to_string()
     
+    # Add Excel-specific context if applicable
+    excel_context = ""
+    if st.session_state.is_excel:
+        excel_context = f"""
+        This data is from an Excel file with the following structure:
+        - Current sheet: {st.session_state.current_sheet}
+        - Available sheets: {', '.join(st.session_state.excel_sheets)}
+        - Sheet metadata: {st.session_state.excel_metadata.get('sheets', {}).get(st.session_state.current_sheet, {})}
+        
+        You can:
+        1. Analyze relationships between different sheets
+        2. Identify table structures and headers
+        3. Handle merged cells and formatting
+        4. Switch between sheets if needed using pandas
+        5. Perform cross-sheet analysis
+        """
+    
     # Format conversation history for the prompt
     messages = []
     messages.append({
         "role": "system", 
-        "content": f"""You are a data analysis assistant. Help the user analyze their CSV data.
+        "content": f"""You are a data analysis assistant. Help the user analyze their {'Excel' if st.session_state.is_excel else 'CSV'} data.
         The DataFrame has the following information:
         {df_info}
         Column Names and Types:
         {columns}
         Sample Data (first 5 rows):
         {df_sample}
+        
+        {excel_context}
+        
         If the user's question requires generating a visualization or performing an analysis, provide Python code using pandas, matplotlib, seaborn, or plotly.
         For visualizations, use plt.figure(figsize=(10, 6)) for matplotlib plots to ensure they're readable.
         For any results that need to be shown, print the results.
         Wrap your code in ```python and ``` tags.
         If the question is general or asking for information, provide a helpful response without code.
-        Your Python code should reference the DataFrame as 'df'. It will be present in the namespace when the code is executed, so do not write code to create it. You have access to the complete chat history, including user queries, LLM responses, and successfully executed code. So, you can use variables from previous messages if needed. The variables present in the namespace are: {', '.join(st.session_state.namespace.keys())}
+        Your Python code should reference the DataFrame as 'df'. It will be present in the namespace when the code is executed, so do not write code to create it.
+        You have access to the complete chat history, including user queries, LLM responses, and successfully executed code.
+        So, you can use variables from previous messages if needed.
+        The variables present in the namespace are: {', '.join(st.session_state.namespace.keys())}
         """
     })
+    
     for msg in conversation_history:
         messages.append(msg)
     messages.append({"role": "user", "content": query})
@@ -361,67 +491,161 @@ def process_data_query(query, df, conversation_history, max_retries=7):
         "fig_plotly": None
     }
 
+def analyze_data_structure(df):
+    """Analyze the first 10 rows of data to determine optimal structure and storage"""
+    
+    # Get the first 10 rows for analysis
+    sample_data = df.head(10)
+    
+    # Get detailed info about the data
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    df_info = buffer.getvalue()
+    
+    # Get column statistics
+    column_stats = df.describe(include='all').to_string()
+    
+    # Create analysis prompt
+    prompt = f"""
+    Analyze this dataset's structure based on the first 10 rows and overall statistics:
+
+    DataFrame Info:
+    {df_info}
+
+    First 10 rows:
+    {sample_data.to_string()}
+
+    Column Statistics:
+    {column_stats}
+
+    Please analyze:
+    1. Whether the current structure is optimal
+    2. If any columns should be split or merged
+    3. If data types need to be changed
+    4. If there are any hierarchical relationships that should be restructured
+    5. If any columns contain multiple pieces of information
+    6. If any numerical columns are actually categorical
+    7. If date/time data needs special handling
+    8. If there are any patterns in the data that suggest a different structure
+
+    If changes are needed, provide Python code to restructure the data. The code should:
+    - Create a new DataFrame with the optimal structure
+    - Handle any necessary data type conversions
+    - Split or merge columns as needed
+    - Add comments explaining each change
+    - Return the restructured DataFrame
+
+    Wrap the code in ```python``` tags if changes are needed.
+    If no changes are needed, explain why the current structure is optimal.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000
+    )
+    
+    result = response.choices[0].message.content
+    
+    # If code is present in the response, execute it
+    if "```python" in result:
+        code_start = result.find("```python") + 9
+        code_end = result.find("```", code_start)
+        code = result[code_start:code_end].strip()
+        
+        try:
+            # Create a copy of the original dataframe
+            df_copy = df.copy()
+            # Execute the restructuring code
+            local_vars = {"df": df_copy}
+            exec(code, local_vars)
+            # Get the restructured dataframe
+            if "df_restructured" in local_vars:
+                return local_vars["df_restructured"], result
+            else:
+                return df_copy, result
+        except Exception as e:
+            st.warning(f"Error during data restructuring: {str(e)}")
+            return df, result
+    
+    return df, result
 
 def handle_file_upload(uploaded_file):
     try:
         file_type = uploaded_file.name.split('.')[-1].lower()
         if file_type == 'csv':
             df = pd.read_csv(uploaded_file)
+            st.session_state.is_excel = False
+            
+            # Analyze and potentially restructure the data
+            with st.spinner("Analyzing data structure..."):
+                df, structure_analysis = analyze_data_structure(df)
+                st.session_state.df = df
+            
+            # Generate description
+            with st.spinner("Analyzing your data..."):
+                description = generate_df_description(df)
+                st.session_state.df_description = description
+            
+            # Add structure analysis to the message
+            full_message = f"""📊 Successfully loaded **{uploaded_file.name}** with {len(df)} rows and {len(df.columns)} columns.
+
+🔍 **Data Structure Analysis:**
+{structure_analysis}
+
+📋 **Data Description:**
+{description}"""
+            
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_message
+            })
+            
         elif file_type in ['xlsx', 'xls']:
-            df = pd.read_excel(uploaded_file)
+            # For Excel files, first read all sheets
+            excel_file = pd.ExcelFile(uploaded_file)
+            st.session_state.excel_sheets = excel_file.sheet_names
+            st.session_state.is_excel = True
+            
+            # Read the first sheet by default
+            df = pd.read_excel(excel_file, sheet_name=st.session_state.excel_sheets[0])
+            st.session_state.current_sheet = st.session_state.excel_sheets[0]
+            
+            # Analyze Excel structure
+            with st.spinner("Analyzing Excel structure..."):
+                st.session_state.excel_metadata = analyze_excel_structure(uploaded_file)
+            
+            # Analyze and potentially restructure the data
+            with st.spinner("Analyzing data structure..."):
+                df, structure_analysis = analyze_data_structure(df)
+                st.session_state.df = df
+            
+            # Generate description
+            with st.spinner("Analyzing your data..."):
+                description = generate_excel_description(df, st.session_state.excel_metadata)
+                st.session_state.df_description = description
+            
+            sheet_info = ""
+            if len(st.session_state.excel_sheets) > 1:
+                sheet_info = f"\n\n📑 This Excel file contains {len(st.session_state.excel_sheets)} sheets: {', '.join(st.session_state.excel_sheets)}\nCurrently showing: {st.session_state.current_sheet}"
+            
+            # Add structure analysis to the message
+            full_message = f"""📊 Successfully loaded **{uploaded_file.name}**{sheet_info}
+
+🔍 **Data Structure Analysis:**
+{structure_analysis}
+
+📋 **Data Description:**
+{description}"""
+            
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_message
+            })
         else:
             raise ValueError(f"Unsupported file format: {file_type}")
 
         st.session_state.df = df
-
-        # Step 1: Data Exploration (already done)
-        with st.spinner("Analyzing your data..."):
-            description = generate_df_description(df)
-            st.session_state.df_description = description
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": f"📊 Successfully loaded **{uploaded_file.name}** with {len(df)} rows and {len(df.columns)} columns.\n\n{description}"
-        })
-        
-
-        # # Prepare context for LLM prompts
-        # buffer = io.StringIO()
-        # df.info(buf=buffer)
-        # df_info = buffer.getvalue()
-        # df_sample = df.head(5).to_string()
-
-        # # Step 2: Data Cleaning (ask LLM for code, run, and update df)
-        # cleaning_prompt = get_data_cleaning_prompt(df_info, df_sample)
-        # result_cleaning = process_data_query(cleaning_prompt, df, [])
-        # # Execute cleaning code and update df
-        # if result_cleaning['code']:
-        #     # The exec should have created 'df_clean' in the local_vars
-        #     result_cleaning = process_data_query(cleaning_prompt, df, [])
-        #     df_clean = st.session_state.namespace.get("df_clean", df)
-        #     st.session_state.df = df_clean
-        #     # Show message
-        #     st.session_state.messages.append({
-        #         "role": "assistant",
-        #         "content": f"🧹 **Data Cleaning Step:**\n\n{result_cleaning['interpreted_output'] or result_cleaning['output'] or result_cleaning['explanation']}"
-        #     })
-        # else:
-        #     df_clean = df
-        #     st.session_state.messages.append({
-        #         "role": "assistant",
-        #         "content": "No cleaning was performed by the LLM."
-        #     })
-
-        # # Step 3: Auto ML (ask LLM for code, run, show result)
-        # buffer = io.StringIO()
-        # df_clean.info(buf=buffer)
-        # df_info_clean = buffer.getvalue()
-        # df_sample_clean = df_clean.head(5).to_string()
-        # automl_prompt = get_automl_prompt(df_info_clean, df_sample_clean)
-        # result_ml = process_data_query(automl_prompt, df_clean, [])
-        # st.session_state.messages.append({
-        #     "role": "assistant",
-        #     "content": f"🤖 **AutoML Step:**\n\n{result_ml['interpreted_output'] or result_ml['output'] or result_ml['explanation']}"
-        # })
 
     except Exception as e:
         error_msg = f"Error reading file: {str(e)}"
@@ -457,6 +681,45 @@ with left_col:
             key=f"file_uploader_{st.session_state.file_uploader_key}",
             help="Upload a CSV or Excel file to analyze"
         )
+        
+        # Excel sheet selector
+        if st.session_state.is_excel and uploaded_file is not None:
+            selected_sheet = st.selectbox(
+                "Select Excel Sheet",
+                st.session_state.excel_sheets,
+                index=st.session_state.excel_sheets.index(st.session_state.current_sheet),
+                key="sheet_selector"
+            )
+            
+            if selected_sheet != st.session_state.current_sheet:
+                st.session_state.current_sheet = selected_sheet
+                df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+                
+                # Analyze and potentially restructure the data
+                with st.spinner(f"Analyzing structure of sheet: {selected_sheet}..."):
+                    df, structure_analysis = analyze_data_structure(df)
+                st.session_state.df = df
+                
+                # Generate new description for the selected sheet
+                with st.spinner(f"Analyzing sheet: {selected_sheet}..."):
+                    description = generate_excel_description(df, st.session_state.excel_metadata)
+                    st.session_state.df_description = description
+                
+                # Create comprehensive message
+                full_message = f"""📑 Switched to sheet: **{selected_sheet}**
+
+🔍 **Data Structure Analysis:**
+{structure_analysis}
+
+📋 **Sheet Description:**
+{description}"""
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_message
+                })
+                st.rerun()
+        
         if uploaded_file is not None:
             handle_file_upload(uploaded_file)
             st.session_state.file_uploader_key += 1
