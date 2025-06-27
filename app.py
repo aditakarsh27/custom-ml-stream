@@ -73,21 +73,25 @@ def analyze_excel_structure(excel_file):
             # Detect tables and header rows
             data_region = ws.calculate_dimension()
             if ":" in data_region:
-                min_col, min_row, max_col, max_row = openpyxl.utils.range_boundaries(data_region)
-                # Check first row for headers
-                header_row = []
-                for col in range(min_col, max_col + 1):
-                    cell = ws.cell(min_row, col)
-                    if cell.font.bold or cell.fill.start_color.index != '00000000':
-                        sheet_info["has_header"] = True
-                    header_row.append(cell.value)
+                from openpyxl.utils import range_boundaries
+                min_col, min_row, max_col, max_row = range_boundaries(data_region)
                 
-                # Detect potential table regions
-                if sheet_info["has_header"]:
-                    sheet_info["potential_tables"].append({
-                        "range": data_region,
-                        "headers": header_row
-                    })
+                # Ensure we have valid values
+                if min_col is not None and min_row is not None and max_col is not None and max_row is not None:
+                    # Check first row for headers
+                    header_row = []
+                    for col in range(min_col, max_col + 1):
+                        cell = ws.cell(min_row, col)
+                        if cell.font.bold or cell.fill.start_color.index != '00000000':
+                            sheet_info["has_header"] = True
+                        header_row.append(cell.value)
+                    
+                    # Detect potential table regions
+                    if sheet_info["has_header"]:
+                        sheet_info["potential_tables"].append({
+                            "range": data_region,
+                            "headers": header_row
+                        })
             
             metadata["sheets"][sheet_name] = sheet_info
         
@@ -141,7 +145,7 @@ def generate_excel_description(df, metadata):
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2000
     )
@@ -192,7 +196,7 @@ def generate_df_description(df):
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2000
     )
@@ -276,7 +280,7 @@ def interpret_code_output(code, output, conversation_history):
     """
     
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=1000
     )
@@ -406,13 +410,13 @@ def process_data_query(query, df, conversation_history, max_retries=7):
             }]
         
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=prompt_messages,
             max_tokens=2000
         )
         response_text = response.choices[0].message.content
 
-        if "```python" in response_text:
+        if response_text and "```python" in response_text:
             code_start = response_text.find("```python") + 9
             code_end = response_text.find("```", code_start)
             code = response_text[code_start:code_end].strip()
@@ -540,7 +544,7 @@ def analyze_data_structure(df):
     """
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2000
     )
@@ -548,7 +552,7 @@ def analyze_data_structure(df):
     result = response.choices[0].message.content
     
     # If code is present in the response, execute it
-    if "```python" in result:
+    if result and "```python" in result:
         code_start = result.find("```python") + 9
         code_end = result.find("```", code_start)
         code = result[code_start:code_end].strip()
@@ -569,6 +573,88 @@ def analyze_data_structure(df):
             return df, result
     
     return df, result
+
+def excel_to_text_representation(excel_file, max_rows=100, max_cols=100):
+    """Convert Excel file to a simple text representation of the first 100 rows and columns"""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_file, data_only=True)
+        
+        text_representation = f"Excel File: {excel_file.name}\n"
+        text_representation += f"Number of sheets: {len(wb.sheetnames)}\n"
+        text_representation += f"Sheet names: {', '.join(wb.sheetnames)}\n\n"
+        
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            text_representation += f"=== Sheet: {sheet_name} ===\n"
+            
+            # Get the data range
+            data_region = ws.calculate_dimension()
+            if ":" in data_region:
+                from openpyxl.utils import range_boundaries
+                min_col, min_row, max_col, max_row = range_boundaries(data_region)
+                
+                # Ensure we have valid values
+                if min_col is not None and min_row is not None and max_col is not None and max_row is not None:
+                    # Limit to max_rows and max_cols
+                    max_row = min(max_row, max_rows)
+                    max_col = min(max_col, max_cols)
+                    
+                    # Add headers
+                    header_row = []
+                    for col in range(min_col, max_col + 1):
+                        cell = ws.cell(min_row, col)
+                        header_row.append(str(cell.value) if cell.value is not None else "")
+                    text_representation += " | ".join(header_row) + "\n"
+                    text_representation += "-" * (len(" | ".join(header_row))) + "\n"
+                    
+                    # Add data rows
+                    for row in range(min_row + 1, max_row + 1):
+                        row_data = []
+                        for col in range(min_col, max_col + 1):
+                            cell = ws.cell(row, col)
+                            row_data.append(str(cell.value) if cell.value is not None else "")
+                        text_representation += " | ".join(row_data) + "\n"
+                else:
+                    text_representation += "Invalid data range\n"
+            else:
+                text_representation += "Empty sheet\n"
+            
+            text_representation += "\n"
+        
+        return text_representation
+    except Exception as e:
+        return f"Error converting Excel to text: {str(e)}"
+
+def analyze_excel_text_structure(text_representation):
+    """Analyze the text representation of Excel data to understand structure"""
+    
+    prompt = f"""
+    Analyze this Excel file's text representation to understand its structure and content:
+
+    {text_representation}
+
+    Please provide a comprehensive analysis including:
+    1. Overall file structure and organization
+    2. Data types and their appropriateness
+    3. Presence of headers and their quality
+    4. Data patterns and relationships
+    5. Potential data quality issues
+    6. Suggestions for analysis based on the data structure
+    7. Any notable characteristics or anomalies
+    8. Recommendations for data processing
+
+    Focus on understanding the data structure and providing insights about the content.
+    Do not provide any code in your response.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000
+    )
+    
+    return response.choices[0].message.content
 
 def handle_file_upload(uploaded_file):
     try:
@@ -602,41 +688,39 @@ def handle_file_upload(uploaded_file):
             })
             
         elif file_type in ['xlsx', 'xls']:
-            # For Excel files, first read all sheets
+            st.session_state.is_excel = True
+            
+            # First, convert Excel to text representation
+            with st.spinner("Converting Excel to text format..."):
+                text_representation = excel_to_text_representation(uploaded_file)
+            
+            # Analyze the text representation
+            with st.spinner("Analyzing Excel structure..."):
+                structure_analysis = analyze_excel_text_structure(text_representation)
+            
+            # Now read the Excel file normally for further processing
             excel_file = pd.ExcelFile(uploaded_file)
             st.session_state.excel_sheets = excel_file.sheet_names
-            st.session_state.is_excel = True
             
             # Read the first sheet by default
             df = pd.read_excel(excel_file, sheet_name=st.session_state.excel_sheets[0])
             st.session_state.current_sheet = st.session_state.excel_sheets[0]
-            
-            # Analyze Excel structure
-            with st.spinner("Analyzing Excel structure..."):
-                st.session_state.excel_metadata = analyze_excel_structure(uploaded_file)
-            
-            # Analyze and potentially restructure the data
-            with st.spinner("Analyzing data structure..."):
-                df, structure_analysis = analyze_data_structure(df)
-                st.session_state.df = df
-            
-            # Generate description
-            with st.spinner("Analyzing your data..."):
-                description = generate_excel_description(df, st.session_state.excel_metadata)
-                st.session_state.df_description = description
+            st.session_state.df = df
             
             sheet_info = ""
             if len(st.session_state.excel_sheets) > 1:
                 sheet_info = f"\n\n📑 This Excel file contains {len(st.session_state.excel_sheets)} sheets: {', '.join(st.session_state.excel_sheets)}\nCurrently showing: {st.session_state.current_sheet}"
             
-            # Add structure analysis to the message
+            # Create comprehensive message
             full_message = f"""📊 Successfully loaded **{uploaded_file.name}**{sheet_info}
 
-🔍 **Data Structure Analysis:**
+🔍 **Excel Structure Analysis:**
 {structure_analysis}
 
-📋 **Data Description:**
-{description}"""
+📋 **Text Representation (First 100 rows/columns):**
+```
+{text_representation}
+```"""
             
             st.session_state.messages.append({
                 "role": "assistant",
@@ -782,30 +866,66 @@ if st.session_state.awaiting_response and st.session_state.df is not None:
         for msg in st.session_state.messages[:-1]
         if msg["role"] in ["user", "assistant"]
     ]
-    with st.spinner("Thinking..."):
-        st.session_state.fig_matplotlib = None
-        st.session_state.fig_plotly = None
-        result = process_data_query(user_query, st.session_state.df, conversation_history)
-        response_content = result["explanation"]
-        if result["output"]:
-            st.session_state.code_output = result["output"]
-            st.session_state.interpreted_output = result["interpreted_output"]
-            st.session_state.code = result["code"]
-            response_content += "\n\n(See visualization and interpretation in the tabs above)"
-        if result["explanation"]:
-            st.write(result["explanation"])
+    
+    # Add retry functionality for question processing
+    max_question_retries = 3
+    question_retries = 0
+    last_error = None
+    
+    while question_retries <= max_question_retries:
+        try:
+            with st.spinner("Thinking..."):
+                st.session_state.fig_matplotlib = None
+                st.session_state.fig_plotly = None
+                result = process_data_query(user_query, st.session_state.df, conversation_history)
+                response_content = result["explanation"]
+                if result["output"]:
+                    st.session_state.code_output = result["output"]
+                    st.session_state.interpreted_output = result["interpreted_output"]
+                    st.session_state.code = result["code"]
+                    response_content += "\n\n(See visualization and interpretation in the tabs above)"
+                if result["explanation"]:
+                    st.write(result["explanation"])
 
-        if result.get("code"):
-            st.session_state.code = result["code"]
+                if result.get("code"):
+                    st.session_state.code = result["code"]
 
-        # Store output for tabs
-        st.session_state.code_output = result.get("output", "")
-        st.session_state.interpreted_output = result.get("interpreted_output", "")
-        st.session_state.figs_matplotlib = result.get("figs_matplotlib", [])
-        st.session_state.fig_plotly = result.get("fig_plotly")
+                # Store output for tabs
+                st.session_state.code_output = result.get("output", "")
+                st.session_state.interpreted_output = result.get("interpreted_output", "")
+                st.session_state.figs_matplotlib = result.get("figs_matplotlib", [])
+                st.session_state.fig_plotly = result.get("fig_plotly")
 
-        st.session_state.messages.append({"role": "assistant", "content": response_content})
-        st.rerun()
+                st.session_state.messages.append({"role": "assistant", "content": response_content})
+                st.rerun()
+                break  # Success, exit retry loop
+                
+        except Exception as e:
+            last_error = str(e)
+            question_retries += 1
+            
+            if question_retries <= max_question_retries:
+                # Add retry message
+                retry_msg = f"⚠️ Attempt {question_retries} failed. Retrying... (Error: {last_error})"
+                st.session_state.messages.append({"role": "assistant", "content": retry_msg})
+                st.rerun()
+            else:
+                # Final failure message
+                error_msg = f"""❌ Sorry, I encountered an error after {max_question_retries} attempts.
+
+**Error Details:**
+{last_error}
+
+**Suggestions:**
+- Try rephrasing your question
+- Check if your data file is properly loaded
+- Try a simpler question first
+- If the problem persists, try uploading your file again
+
+Would you like to try asking your question again?"""
+                
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.rerun()
 
 if __name__ == "__main__":
     pass
